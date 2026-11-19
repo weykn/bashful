@@ -1,0 +1,15 @@
+# Compiler binary
+/bashful
+
+# Test output (recreated by tests/run_tests.sh)
+/tests/out/
+
+# Compiled output: generated LLVM IR and binaries
+*.ll
+*.o
+/testfile
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
