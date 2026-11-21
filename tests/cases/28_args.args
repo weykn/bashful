@@ -1,0 +1,15 @@
+
+a
+a b c
+"with space" "" 'single quoted'
+-v -v -o file.txt -n 5 x y z
+-n
+-x -v
+-- -v notanoption
+1 2 3 -4 007 08 99999999
+key=value path=/usr/bin/env =lead trail= a=b=c
+/usr/local/lib/libfoo.so.1 /root /
+'*' '?' '[a]' '$HOME' '`x`' '\n' 'tab	here'
+-n 12 10 20 30
+café 日本 🎉
+-vn3 extra

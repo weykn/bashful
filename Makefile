@@ -1,17 +1,56 @@
-# Bashful Compiler: bash -> LLVM IR compiler (written in C) + embedded runtime
-CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wno-unused-parameter -Wno-misleading-indentation
+# bashful: bash -> LLVM IR compiler, written in bash and compiled by itself, + the embedded C runtime
 RT      := $(CURDIR)/runtime
+OPT     := -O2
+SRCS    := compiler/util.sh compiler/parser.sh compiler/check.sh compiler/emit.sh compiler/arith.sh \
+           compiler/test.sh compiler/gen.sh compiler/compile.sh compiler/rtlink.sh compiler/main.sh
+RTSRCS  := $(wildcard runtime/*.c runtime/*.h runtime/*.def)
 
 all: bashful
 
-bashful: compiler/bashful.c runtime/tools.def runtime/bash_runtime.h
-	$(CC) $(CFLAGS) -I$(RT) -DRUNTIME_DIR='"$(RT)"' $< -o $@
+# the compiler as one bash script (bashful compiles a single file: there is no `source`)
+build/bashful.sh: $(SRCS) Makefile
+	@mkdir -p build
+	@{ printf '#!/usr/bin/env bash\n# bashful compiler: generated from compiler/*.sh by make\n'; \
+	  printf "RUNTIME_DIR='%s'\nOPT='%s'\n" '$(RT)' '$(OPT)'; \
+	  cat $(SRCS); printf 'main "$$@"\n'; } > $@.tmp
+	@chmod +x $@.tmp && mv $@.tmp $@
 
+# stage 1: the previous native compiler (if there is a working one) or, from scratch, the system bash running
+#          the compiler on its own source (slow: bash is quadratic on long strings)
+# stage 2: the new compiler compiles itself
+bashful: build/bashful.sh $(RTSRCS)
+	@if [ -x ./bashful ] && ./bashful --strict -q build/bashful.sh -o build/stage1 2> /dev/null; then \
+		echo "stage 1: compiled by the previous ./bashful"; \
+	else \
+		echo "stage 1: compiled by bash (bootstrap, takes a minute or two)"; \
+		bash build/bashful.sh --strict -q build/bashful.sh -o build/stage1; \
+	fi
+	./build/stage1 --strict -q build/bashful.sh -o build/stage2
+	@mv build/stage2 $@ && rm -f build/stage1
+
+# from scratch, with nothing but bash and clang
+bootstrap:
+	rm -f bashful
+	$(MAKE) bashful
+
+# self-hosting check: the native compiler must generate exactly the IR the bash-interpreted one generates
+selfcheck: bashful
+	bash build/bashful.sh --strict --emit-ir build/bashful.sh -o build/stage0.ll
+	./bashful --strict --emit-ir build/bashful.sh -o build/stage1.ll
+	cmp build/stage0.ll build/stage1.ll && echo "selfcheck: stage0 and stage1 generate identical IR"
+
+# correctness cases + benchmarks: every script must produce exactly what bash produces
 test: bashful
-	./tests/run_tests.sh
+	./tests/bench.sh tests/cases tests/bench
+
+bench: bashful
+	./tests/bench.sh -n 3 tests/bench
+
+# how long compiling takes (binaries are not run)
+compile-bench: bashful
+	./tests/compile_bench.sh -n 5 tests/bench
 
 clean:
-	rm -f bashful tests/out/*
+	rm -rf bashful bashful.tmp build
 
-.PHONY: all test clean
+.PHONY: all bootstrap selfcheck test bench compile-bench clean

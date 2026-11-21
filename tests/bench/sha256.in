@@ -1,0 +1,104 @@
+/* rt_vars.c - variables (scalars, indexed and associative arrays), positional and special parameters */
+#include "rt.h"
+
+unsigned long g_ver;   /* every scalar write gets a fresh version (substring position caches) */
+static unsigned asc_hash(const char *s) { unsigned i = 2166136261u; for (; *s; s++) { i *= 16777619u; i ^= (unsigned)(int)(signed char)*s; } return i; }
+Asc *asc_new(void) { Asc *a = malloc(sizeof *a); a->nb = 1024; a->n = 0; a->b = calloc(1024, sizeof *a->b); return a; }
+static void asc_grow(Asc *a) {
+    int nn = a->nb * 4; AItem **nb = calloc(nn, sizeof *nb);
+    for (int i = 0; i < a->nb; i++) for (AItem *it = a->b[i], *nx; it; it = nx) { nx = it->next; unsigned k = it->h & (nn - 1); it->next = nb[k]; nb[k] = it; }
+    free(a->b); a->b = nb; a->nb = nn;
+}
+AItem *asc_find(Asc *a, const char *k, int create) {
+    unsigned h = asc_hash(k);
+    for (AItem *it = a->b[h & (a->nb - 1)]; it; it = it->next) if (it->h == h && !strcmp(it->k, k)) return it;
+    if (!create) return NULL;
+    if (a->n >= a->nb * 2) asc_grow(a);
+    AItem *it = malloc(sizeof *it); size_t L = strlen(k); it->k = malloc(L + 1); memcpy(it->k, k, L + 1);
+    it->v = NULL; it->iv = 0; it->vk = 0; it->h = h; unsigned b = h & (a->nb - 1); it->next = a->b[b]; a->b[b] = it; a->n++;
+    return it;
+}
+static void asc_del(Asc *a, const char *k) {
+    unsigned h = asc_hash(k); AItem **pp = &a->b[h & (a->nb - 1)];
+    for (; *pp; pp = &(*pp)->next) if ((*pp)->h == h && !strcmp((*pp)->k, k)) { AItem *it = *pp; *pp = it->next; free(it->k); free(it->v); free(it); a->n--; return; }
+}
+void asc_free(Asc *a) {
+    if (!a) return;
+    for (int i = 0; i < a->nb; i++) for (AItem *it = a->b[i], *nx; it; it = nx) { nx = it->next; free(it->k); free(it->v); free(it); }
+    free(a->b); free(a);
+}
+static Asc *asc_copy(const Asc *o) {
+    if (!o) return NULL;
+    Asc *a = malloc(sizeof *a); a->nb = o->nb; a->n = o->n; a->b = calloc(o->nb, sizeof *a->b);
+    for (int i = 0; i < o->nb; i++) { AItem **tail = &a->b[i];
+        for (const AItem *it = o->b[i]; it; it = it->next) { AItem *c = malloc(sizeof *c); *c = *it; c->k = strdup(it->k); c->v = it->v ? strdup(it->v) : NULL; c->next = NULL; *tail = c; tail = &c->next; } }
+    return a;
+}
+const char *ai_str(AItem *it) {
+    if (it->vk & 2) return it->v;
+    char b[24]; snprintf(b, sizeof b, "%ld", it->iv); it->v = strdup(b); it->vk |= 2; return it->v;
+}
+void ai_set(AItem *it, const char *val, int append) {
+    char *n;
+    if (append && it->vk) { const char *o = ai_str(it); size_t a = strlen(o), b = strlen(val); n = malloc(a + b + 1); memcpy(n, o, a); memcpy(n + a, val, b + 1); }
+    else n = strdup(val);
+    free(it->v); it->v = n; it->vk = 2;
+}
+void ai_seti(AItem *it, long x) { free(it->v); it->v = NULL; it->iv = x; it->vk = 4; }
+int asc_list(const Asc *a, const char ***out, int keys) {   /* borrowed strings in bash order */
+    const char **l = malloc((a->n + 1) * sizeof *l); int n = 0;
+    for (int i = 0; i < a->nb; i++) for (AItem *it = a->b[i]; it; it = it->next) l[n++] = keys ? it->k : ai_str(it);
+    *out = l; return n;
+}
+Var **vt; int nvt, capvt;
+static int *ht; static int htcap;                 /* open-addressing name -> slot (stored +1) */
+unsigned cur_gen;                          /* generation of the innermost subshell (0 = none) */
+
+unsigned hash_str(const char *s) { unsigned h = 2166136261u; while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; } return h; }
+void ht_rebuild(int ncap) {
+    free(ht); ht = calloc(ncap, sizeof(int)); htcap = ncap;
+    for (int i = 0; i < nvt; i++) { unsigned h = hash_str(vt[i]->name) & (ncap - 1); while (ht[h]) h = (h + 1) & (ncap - 1); ht[h] = i + 1; }
+}
+int vt_add(const char *name, int copy) {
+    if (nvt == capvt) { capvt = capvt ? capvt * 2 : 256; vt = xrealloc(vt, capvt * sizeof *vt); }
+    Var *v = calloc(1, sizeof *v); v->name = copy ? xstrdup(name) : name; vt[nvt] = v;
+    if ((nvt + 1) * 2 > htcap) { nvt++; ht_rebuild(htcap ? htcap * 2 : 1024); return nvt - 1; }
+    unsigned h = hash_str(name) & (htcap - 1); while (ht[h]) h = (h + 1) & (htcap - 1); ht[h] = nvt + 1;
+    return nvt++;
+}
+int name_id(const char *name, int create) {
+    if (htcap) { unsigned h = hash_str(name) & (htcap - 1); while (ht[h]) { Var *v = vt[ht[h] - 1]; if (!strcmp(v->name, name)) return ht[h] - 1; h = (h + 1) & (htcap - 1); } }
+    return create ? vt_add(name, 1) : -1;
+}
+
+static const char *var_str_noarr(Var *v) {
+    if (v->flags & VF_STR) return v->val;
+    if (v->flags & VF_INT) { v->val = xmalloc(24); snprintf(v->val, 24, "%ld", v->ival); v->flags |= VF_STR; v->vcap = 0; return v->val; }
+    return NULL;
+}
+/* undo log: variables modified inside a subshell are restored when it ends */
+Undo *ulog; int nulog; static int capulog;
+static Var var_snapshot(const Var *o) {
+    Var s = *o; s.val = o->val ? xstrdup(o->val) : NULL; s.vcap = 0; s.as = asc_copy(o->as);
+    if (o->arr) {
+        int c = o->arrn ? o->arrn : 1; s.arrcap = c;
+        s.arr = xmalloc(c * sizeof(char *)); s.ai = xmalloc(c * sizeof(long)); s.ak = xmalloc(c);
+        for (int i = 0; i < o->arrn; i++) { s.arr[i] = o->arr[i] ? xstrdup(o->arr[i]) : NULL; s.ai[i] = o->ai[i]; s.ak[i] = o->ak[i]; }
+    }
+    return s;
+}
+void var_release(Var *v) {
+    free(v->val); v->val = NULL; v->ver = ++g_ver; v->vcap = 0; asc_free(v->as); v->as = NULL;
+    for (int i = 0; i < v->arrn; i++) free(v->arr[i]);
+    free(v->arr); free(v->ai); free(v->ak); v->arr = NULL; v->ai = NULL; v->ak = NULL; v->arrn = v->arrcap = 0;
+}
+static void arr_grow(Var *v, long n) {   /* make indices < n valid (new ones unset) */
+    if (n > v->arrcap) {
+        long c = v->arrcap ? v->arrcap : 8; while (c < n) c *= 2;
+        v->arr = xrealloc(v->arr, c * sizeof(char *)); v->ai = xrealloc(v->ai, c * sizeof(long)); v->ak = xrealloc(v->ak, c); v->arrcap = (int)c;
+    }
+    for (long i = v->arrn; i < n; i++) { v->arr[i] = NULL; v->ak[i] = 0; }
+    if (n > v->arrn) v->arrn = (int)n;
+}
+const char *el_str(Var *v, long i) {
+    unsigned char 

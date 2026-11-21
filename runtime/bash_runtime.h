@@ -1,8 +1,8 @@
 /* bash_runtime.h - ABI between LLVM IR emitted by bashful and the embedded runtime.
  *
- * Everything here runs inside the compiled program's own process: there is no
- * fork/exec/posix_spawn anywhere.  "External tools" (cat, kill, grep, ...) are
- * ordinary C functions named bash_external_<tool> / bash_internal_<builtin>(argc, argv).
+ * Builtins and embedded programs (cat, grep, sort, ...) are ordinary C functions named
+ * bash_internal_<builtin> / bash_external_<tool>(argc, argv) that run inside the compiled program's
+ * own process.  Programs that are not embedded are run for real (posix_spawn / fork+exec).
  */
 #ifndef BASH_RUNTIME_H
 #define BASH_RUNTIME_H
@@ -13,7 +13,7 @@ typedef int (*bash_body_t)(void);                  /* compiled blocks (subshell,
 typedef char *(*bash_str_t)(void);                 /* compiled word (param-expansion operand), malloc'd result */
 
 /* word builder modes */
-enum { WB_ARGV = 0, WB_STR = 1, WB_PATTERN = 2 };
+enum { WB_ARGV = 0, WB_STR = 1, WB_PATTERN = 2, WB_REGEX = 3 };   /* PATTERN/REGEX: quoted text is escaped for fnmatch/ERE */
 /* literal kinds */
 enum { LIT_EXPANDED = 0, LIT_QUOTED = 1, LIT_PLAIN = 2 };
 
@@ -30,18 +30,25 @@ enum { P_PLAIN, P_DEFAULT, P_DEFAULT_NC, P_ASSIGN, P_ASSIGN_NC, P_ALT, P_ALT_NC,
 typedef struct WordBuilder WordBuilder;
 
 /* special parameter kinds (compile-time classified) */
-enum { SP_STATUS = 1, SP_NARGS, SP_PID, SP_BANG, SP_DASH, SP_ZERO, SP_RANDOM, SP_PPID, SP_SECONDS, SP_AT, SP_STAR, SP_FUNCNAME, SP_SOURCE };
+enum { SP_STATUS = 1, SP_NARGS, SP_PID, SP_BANG, SP_DASH, SP_ZERO, SP_RANDOM, SP_PPID, SP_SECONDS, SP_AT, SP_STAR, SP_FUNCNAME, SP_SOURCE, SP_EPOCHSEC, SP_EPOCHREAL };
+
+/* Defined by the compiled script: 1 = embedded programs (cat, grep, sort, ...) run in-process,
+ * 0 = built with --no-embed, every external command runs the program installed on the system. */
+extern const int bash_rt_embed;
 
 /* ---- lifecycle.  `names` is the compile-time variable table: variable i has slot i. ---- */
 void  bash_rt_init(int argc, char **argv, const char **names, int nnames);
 void  bash_rt_exit(int code);
+int   bash_rt_line(bash_body_t body);    /* one top-level line of a script */
+void  bash_rt_expansion_error(void);     /* fatal expansion error: abandon the line / exit the subshell */
 
 /* ---- variables by compile-time slot (hot path) ---- */
 long        bash_rt_geti(int id);                 /* arithmetic value (cached integer) */
 long        bash_rt_geti_t(int id);               /* strict integer for [ ] / [[ ]] */
 void        bash_rt_seti(int id, long v);
 const char *bash_rt_gets(int id);                 /* NULL when unset */
-const char *bash_rt_gets_e(int id);               /* "" when unset (honors set -u) */
+const char *bash_rt_gets_e(int id);
+const char *bash_rt_gets_elem_e(int id, long idx);               /* "" when unset (honors set -u) */
 void        bash_rt_set_id(int id, const char *s, int append);
 void        bash_rt_set_elem_id(int id, long idx, const char *s, int append);
 void        bash_rt_set_array_id(int id, int argc, char **argv, int append);
@@ -91,7 +98,8 @@ void  bash_rt_set(const char *name, const char *val, int append);
 void  bash_rt_set_array(const char *name, int argc, char **argv, int append);
 void  bash_rt_tmp_set(const char *name, const char *val);
 int   bash_rt_arith(const char *expr);          /* (( )) evaluated at run time: status 0 if non-zero */
-long  bash_rt_arith_eval(const char *expr, int *err);
+long  bash_rt_arith_eval(const char *expr, int *err);      /* syntax error: exit 1 (expansion context) */
+long  bash_rt_arith_eval_nf(const char *expr, int *err);   /* syntax error: *err = 1, warning only */
 long  bash_rt_arith_str(const char *expr);
 long  bash_rt_div(long a, long b);
 long  bash_rt_mod(long a, long b);
@@ -134,6 +142,7 @@ void  bash_rt_flush(void);
 void  bash_rt_cwd_changing(void);
 
 /* ---- helpers for builtins ---- */
+const char *bash_rt_ifs(void);                     /* current IFS (default when unset) */
 const char *bash_rt_getvar(const char *name);        /* NULL when unset */
 void  bash_rt_setvar(const char *name, const char *val);
 void  bash_rt_export(const char *name);
@@ -149,7 +158,8 @@ void  bash_rt_opt_set(char o, int v);
 int   bash_rt_pipefail_get(void);
 void  bash_rt_pipefail_set(int v);
 void  bash_rt_warn(const char *fmt, ...);
-int   bash_rt_test(int n, char **a, int dbl);   /* operands only, no name / closing bracket */
+int   bash_rt_test(int n, char **a, int dbl);
+char *bash_rt_pat_quote(char *s);   /* operands only, no name / closing bracket */
 
 /* ---- processes (real programs, forked pipelines, jobs, traps) ---- */
 #define BASH_TOOL_FALLBACK (-1000)                  /* embedded tool: "run the real program instead" */

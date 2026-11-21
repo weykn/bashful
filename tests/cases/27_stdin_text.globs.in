@@ -1,0 +1,10 @@
+*
+* ?
+[ab]*
+g*
+?2
+[!a]1
+*.nomatch
+{a,b}
+~
+$HOME $(echo hi) `id`
