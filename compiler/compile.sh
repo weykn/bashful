@@ -64,6 +64,9 @@ declare i32 @bash_rt_redir_ok()
 declare void @bash_rt_redir_pop()
 declare void @bash_rt_redir_commit()
 declare i32 @bash_rt_subshell(ptr)
+declare void @bash_rt_lineno(i32)
+declare i32 @bash_rt_time_start()
+declare void @bash_rt_time_end(i32, i32)
 declare i32 @bash_rt_pipeline(i32, ptr)
 declare i32 @bash_rt_case_match(ptr, ptr)
 declare void @bash_rt_declare_local(ptr)
@@ -126,6 +129,8 @@ compile_native() {   # srcname out_file unsup_file
 	[[ -n ${S:I:1} ]] && perr "unexpected token"
 	NOREBASE=1
 	walk $root
+	shlib_nodes
+	NK[root]="$R${NK[root]}"
 	ARMED=0
 	rk=(${NK[root]})
 	for k in "${rk[@]}"; do   # functions defined exactly once, at the top level: called directly once defined

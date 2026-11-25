@@ -285,6 +285,90 @@ static char *casemod(const char *s, int op) {
     }
     return o;
 }
+/* ${x@a}: the attribute letters, in bash's order */
+static void attr_letters(Var *v, char *o) {
+    int f = v ? v->flags : 0; char *p = o;
+    if (f & VF_ARR) *p++ = 'a';
+    if (f & VF_ASC) *p++ = 'A';
+    if (f & VF_INT) *p++ = 'i';
+    if (f & VF_RO) *p++ = 'r';
+    if (f & VF_EXP) *p++ = 'x';
+    *p = 0;
+}
+/* ${x@A} ${x@K} ${x@k} ${x@a}: forms that need the whole variable */
+static void at_var(WordBuilder *b, Ref *r, int c, int quoted) {
+    Var *v = r->vid >= 0 ? vt[r->vid] : NULL;
+    char fl[16]; attr_letters(v, fl);
+    int list = ref_is_list(r);
+    SB o = { 0 };
+    if (c == 'a') {
+        if (list && v && (v->flags & (VF_ARR | VF_ASC))) { const char **l; int n = ref_list(r, &l); const char **w = xmalloc((n + 1) * sizeof *w); for (int i = 0; i < n; i++) w[i] = fl; wb_emit_list(b, w, n, quoted, ref_is_star(r)); free(w); free(l); return; }
+        wb_append(b, v && var_isset(v) ? fl : "", quoted);
+        return;
+    }
+    if (r->vid == -1) {   /* "$@": set -- 'a' 'b' for @A, the quoted words for @K */
+        const char **l; int n = ref_list(r, &l);
+        if (c == 'k') { wb_emit_list(b, l, n, quoted, ref_is_star(r)); free(l); return; }
+        if (c == 'A') sb_puts(&o, "set --");
+        for (int i = 0; i < n; i++) { if (i || c == 'A') sb_putc(&o, ' '); rt_quote_q(&o, l[i]); }
+        free(l);
+    } else if (list && v && (v->flags & (VF_ARR | VF_ASC))) {   /* the whole array */
+        int asc = v->flags & VF_ASC;
+        const char **keys = NULL; int nk = 0; char **store = NULL;
+        if (asc) nk = asc_list(v->as, &keys, 1);
+        else {
+            store = xmalloc((v->arrn + 1) * sizeof *store); keys = xmalloc((v->arrn + 1) * sizeof *keys);
+            for (int i = 0; i < v->arrn; i++) if (v->ak[i] & AK_SET) { char t[32]; rt_ltoa(t, i); store[nk] = xstrdup(t); keys[nk] = store[nk]; nk++; }
+        }
+        if (c == 'k') {
+            const char **w = xmalloc((2 * nk + 1) * sizeof *w);
+            for (int i = 0; i < nk; i++) { w[2 * i] = keys[i]; w[2 * i + 1] = asc ? ai_str(asc_find(v->as, keys[i], 0)) : el_str(v, atol(keys[i])); }
+            wb_emit_list(b, w, 2 * nk, quoted, ref_is_star(r)); free(w);
+        } else {
+            if (c == 'A') { sb_puts(&o, "declare -"); sb_puts(&o, fl); sb_putc(&o, ' '); sb_puts(&o, v->name); }
+            if (c == 'A' && asc && !nk) { /* declare -A w */ }
+            else {
+                if (c == 'A') sb_puts(&o, "=(");
+                for (int i = 0; i < nk; i++) {
+                    const char *val = asc ? ai_str(asc_find(v->as, keys[i], 0)) : el_str(v, atol(keys[i]));
+                    if (i) sb_putc(&o, ' ');
+                    if (c == 'A') sb_putc(&o, '[');
+                    if (asc) rt_quote_key(&o, keys[i]); else sb_puts(&o, keys[i]);
+                    sb_puts(&o, c == 'A' ? "]=" : " ");
+                    rt_quote_dq(&o, val ? val : "");
+                }
+                if (asc && nk) sb_putc(&o, ' ');
+                if (c == 'A') sb_putc(&o, ')');
+            }
+        }
+        for (int i = 0; store && i < nk; i++) free(store[i]);
+        free(store); free(keys);
+        if (c == 'k') return;
+    } else {   /* one value */
+        const char *s = ref_scalar(r);
+        if (c == 'k' || c == 'K') { if (s) rt_quote_q(&o, s); }
+        else if (v && (s || *fl)) {   /* @A */
+            int loc = rt_var_is_local(r->vid);
+            if (*fl || loc) { sb_puts(&o, "declare "); if (*fl) { sb_putc(&o, '-'); sb_puts(&o, fl); sb_putc(&o, ' '); } }
+            sb_puts(&o, v->name);
+            if (s) { sb_putc(&o, '='); rt_quote_q(&o, s); }
+        }
+    }
+    char *t = sb_take(&o); wb_append(b, t, quoted); free(t);
+}
+/* ${!prefix*} ${!prefix@}: the names of the set variables that start with prefix, sorted */
+static int cmp_names(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+static void names_with_prefix(WordBuilder *b, const char *pfx, int star, int quoted) {
+    size_t L = strlen(pfx); int n = 0;
+    const char **l = xmalloc((nvt + 1) * sizeof *l);
+    for (int i = 0; i < nvt; i++) {
+        Var *v = vt[i];
+        if (!strncmp(v->name, pfx, L) && var_isset(v) && (isalpha((unsigned char)v->name[0]) || v->name[0] == '_')) l[n++] = v->name;
+    }
+    qsort(l, n, sizeof *l, cmp_names);
+    wb_emit_list(b, l, n, quoted, star);
+    free(l);
+}
 typedef struct { bash_str_t f; const char *c; } Opd;
 static char *opd_get(const Opd *o, int *owned) { if (o->f) { *owned = 1; return o->f(); } *owned = 0; return (char *)(o->c ? o->c : ""); }
 
@@ -305,6 +389,33 @@ static void param_core(WordBuilder *b, Ref *r, int op, Opd A, Opd C, int quoted)
         wb_emit_list(b, l, n, quoted, r->kind == 2);
         for (int i = 0; i < n; i++) free(store[i]);
         free(store); free(l); break; }
+    case P_NAMES: case P_NAMES_STAR: names_with_prefix(b, r->sname, op == P_NAMES_STAR, quoted); break;
+    case P_AT: {
+        int ow; char *ls = opd_get(&A, &ow); int c = *ls; if (ow) free(ls);
+        if (c == 'A' || c == 'K' || c == 'k' || c == 'a') { at_var(b, r, c, quoted); break; }
+        const char **l; int n; const char *one = NULL;
+        if (islist) n = ref_list(r, &l);
+        else {
+            one = ref_scalar(r);
+            if (!one) { if (opt_u && r->vid != -2) { bash_rt_warn("%s: unbound variable", r->sname); bash_rt_exit(1); } wb_append(b, "", quoted); break; }
+            l = xmalloc(2 * sizeof *l); l[0] = one; n = 1;
+        }
+        char **out = xmalloc((n + 1) * sizeof *out);
+        for (int i = 0; i < n; i++) {
+            SB o = { 0 };
+            switch (c) {
+            case 'Q': rt_quote_q(&o, l[i]); out[i] = sb_take(&o); break;
+            case 'E': out[i] = rt_ansic_decode(l[i]); break;
+            case 'U': out[i] = casemod(l[i], P_UPALL); break;
+            case 'u': out[i] = casemod(l[i], P_UP1); break;
+            case 'L': out[i] = casemod(l[i], P_LOWALL); break;
+            default: out[i] = xstrdup(l[i]);
+            }
+        }
+        wb_emit_list(b, (const char **)out, n, quoted, ref_is_star(r));
+        for (int i = 0; i < n; i++) free(out[i]);
+        free(out); free(l);
+        break; }
     case P_INDIRECT: {
         const char *s = ref_scalar(r);
         if (s) { Ref r2; ref_from_name(s, &r2); if (ref_is_list(&r2)) { const char **l; int n = ref_list(&r2, &l); wb_emit_list(b, l, n, quoted, ref_is_star(&r2)); free(l); } else { const char *t = ref_scalar(&r2); wb_append(b, t ? t : "", quoted); } ref_free(&r2); }

@@ -25,12 +25,12 @@ enum { R_IN, R_OUT, R_APPEND, R_DUP_IN, R_DUP_OUT, R_RDWR, R_HEREDOC, R_CLOBBER,
 enum { P_PLAIN, P_DEFAULT, P_DEFAULT_NC, P_ASSIGN, P_ASSIGN_NC, P_ALT, P_ALT_NC,
        P_ERR, P_ERR_NC, P_LEN, P_TRIM_S, P_TRIM_L, P_TRIM_SE, P_TRIM_LE,
        P_SUBST, P_SUBST_ALL, P_SUBST_PRE, P_SUBST_SUF, P_SUBSTR,
-       P_UP1, P_UPALL, P_LOW1, P_LOWALL, P_KEYS, P_INDIRECT };
+       P_UP1, P_UPALL, P_LOW1, P_LOWALL, P_KEYS, P_INDIRECT, P_AT, P_NAMES, P_NAMES_STAR };
 
 typedef struct WordBuilder WordBuilder;
 
 /* special parameter kinds (compile-time classified) */
-enum { SP_STATUS = 1, SP_NARGS, SP_PID, SP_BANG, SP_DASH, SP_ZERO, SP_RANDOM, SP_PPID, SP_SECONDS, SP_AT, SP_STAR, SP_FUNCNAME, SP_SOURCE, SP_EPOCHSEC, SP_EPOCHREAL };
+enum { SP_STATUS = 1, SP_NARGS, SP_PID, SP_BANG, SP_DASH, SP_ZERO, SP_RANDOM, SP_PPID, SP_SECONDS, SP_AT, SP_STAR, SP_FUNCNAME, SP_SOURCE, SP_EPOCHSEC, SP_EPOCHREAL, SP_LINENO };
 
 /* Defined by the compiled script: 1 = embedded programs (cat, grep, sort, ...) run in-process,
  * 0 = built with --no-embed, every external command runs the program installed on the system. */
@@ -133,6 +133,12 @@ void  bash_rt_redir_commit(void);   /* keep redirections (exec >file) */
 
 /* ---- blocks ---- */
 int   bash_rt_subshell(bash_body_t body);
+void  bash_rt_lineno(int line);
+char *bash_rt_printf_q(const char *s);
+void  bash_rt_umask_changing(void);
+long  bash_rt_start_time(void);
+int   bash_rt_time_start(void);
+void  bash_rt_time_end(int slot, int posix);
 int   bash_rt_pipeline(int n, bash_body_t *stages);
 int   bash_rt_case_match(const char *word, const char *pattern);
 

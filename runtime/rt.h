@@ -101,7 +101,7 @@ extern Frame *frames; extern int nframes, capframes;
 typedef struct Sub {
     jmp_buf jb; struct Sub *prev; int exit_code;
     int frame_depth, redir_depth, tmp_depth, log_base; unsigned saved_gen;
-    char **spos; int snpos; void *sblock; char *cwd; int e, u, pf;
+    char **spos; int snpos; void *sblock; char *cwd; int e, u, pf; int umask;   /* umask: -1 untouched */
     void *trapsave;
 } Sub;
 extern Sub *cur_sub; extern unsigned gen_counter;
@@ -117,6 +117,7 @@ struct WordBuilder {
 extern Cap *g_cap;
 extern int bash_rt_sinking;
 extern const char *g_argv0;
+extern int g_lineno;
 extern int g_status, g_cs_status;
 extern volatile sig_atomic_t g_trap_pending;
 extern int g_utf8;
@@ -129,6 +130,13 @@ extern int npos;
 extern void *pos_block;
 extern pid_t g_last_bg, g_shell_pid;
 extern int g_is_child;
+extern const char *g_repl_state;
+extern int g_interactive;
+void rt_quote_q(SB *o, const char *s);
+void rt_quote_dq(SB *o, const char *s);
+void rt_quote_key(SB *o, const char *s);
+char *rt_ansic_decode(const char *s);
+int rt_var_is_local(int id);
 extern bash_body_t trap_fn[65];
 extern int trap_mode[65];
 

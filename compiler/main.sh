@@ -2,10 +2,15 @@
 # RUNTIME_DIR and OPT are set by the build (see the Makefile).
 
 usage() {
-	printf '%s\n' "usage: bashful [options] script.sh [args...]" \
+	printf '%s\n' "usage: bashful [options] script.sh [args...]   compile and run the script" \
+		"       bashful [options] script.sh -o FILE     compile to an executable" \
+		"       bashful [-i] [args...]                  interactive shell (like bash -i)" \
 		"  -o, --output FILE   output file" \
-		"  -r, --run           compile and run" \
+		"  -r, --run           compile and run (the default without -o or --emit-*)" \
 		"  -c, --command STR   compile and run STR" \
+		"  -i, --interactive   interactive shell: every command is compiled and run natively; reads" \
+		"                      /etc/bash.bashrc, ~/.bashrc and ~/.bashfulrc like bash -i reads its startup files" \
+		"  --norc              interactive shell without the startup files" \
 		"  --emit-ir           write LLVM IR" \
 		"  --emit-bc           write LLVM bitcode" \
 		"  --strict            fail instead of falling back to embedded bash for unsupported features" \
@@ -144,49 +149,11 @@ have_lld() {   # ld.lld somewhere in PATH
 	done
 	return 1
 }
-main() {
-	local in= out= mode=0 runflag=0 nofallback=0 quiet=0 hascmd=0 cmdtext= srcname a rc final b tmp_ll tmp_dir tmp_out stdout_mode=0 dst lld src_ll x keytext merged=0 objs= keep path i
-	local -a sargs args
-	load_tools
-	while (($#)); do
-		a=$1
-		if [[ -n $in ]] && ((runflag || hascmd)); then sargs+=("$a"); shift; continue; fi   # everything after the script goes to the script
-		case $a in
-		-o | --output)
-			(($# > 1)) || { usage >&2; die "unknown option $a"; }
-			out=$2
-			shift
-			;;
-		-c | --command | --inline)
-			(($# > 1)) || { usage >&2; die "unknown option $a"; }
-			cmdtext=$2 hascmd=1 in=bash CMD_MODE=1
-			shift
-			;;
-		-r | --run) runflag=1 ;;
-		--emit-ir) mode=1 ;;
-		--emit-bc) mode=2 ;;
-		--no-fallback | --strict) nofallback=1 ;;
-		-q | --quiet) quiet=1 ;;
-		--no-embed) NO_EMBED=1 ;;
-		-h | --help) usage; exit 0 ;;
-		-?*) usage >&2; die "unknown option $a" ;;
-		*) if [[ -z $in ]]; then in=$a; else die "unexpected argument $a"; fi ;;
-		esac
-		shift
-	done
-	if [[ -z $in ]]; then usage >&2; exit 1; fi
-	((hascmd && mode == 0)) && runflag=1
-	if ((hascmd && ${#sargs[@]} > 0)); then   # like bash -c: the first extra argument is $0
-		in=${sargs[0]}
-		args=()
-		for ((i = 1; i < ${#sargs[@]}; i++)); do args+=("${sargs[i]}"); done
-		sargs=("${args[@]}")
-	fi
-	((runflag && mode != 0)) && die "--run cannot be combined with --emit-ir/--emit-bc"
-	if ((mode == 0 && !runflag)) && [[ -z $out ]]; then usage >&2; die "no output file: use -o/--output FILE to build an executable, or -r/--run to run the script"; fi
-	[[ $out == - ]] && ((mode != 1)) && die "only --emit-ir can write to stdout"
-	if ((hascmd)); then SRC=$cmdtext srcname=-c; else slurp "$in"; srcname=$in; fi
-
+# compile SRC (named $1 in messages) into $2: an executable (MODE 0), LLVM IR (1) or bitcode (2); "-" with
+# MODE 1 leaves the IR in TMP_OUT for the caller to print.  BF_EPILOGUE/BF_PROLOGUE: bash code put around SRC
+# when it has to run on the bash fallback (interactive mode).
+build_exe() {   # srcname final
+	local srcname=$1 final=$2 rc tmp_ll tmp_dir dst lld src_ll x keytext merged=0 objs=
 	tmp_ll=/tmp/bashful.$$.ll
 	rm -f "$tmp_ll.unsup"
 	(compile_native "$srcname" "$tmp_ll" "$tmp_ll.unsup")
@@ -195,33 +162,18 @@ main() {
 		UNSUP=
 		[[ -r $tmp_ll.unsup ]] && IFS= read -r -d '' UNSUP < "$tmp_ll.unsup"
 		rm -f "$tmp_ll.unsup"
-		((nofallback)) && { rm -f "$tmp_ll"; die "$srcname: cannot compile natively: $UNSUP"; }
-		((quiet)) || printf 'bashful: note: %s: %s -> using the embedded-bash fallback for this script (exact bash semantics, no native speedup)\n' "$srcname" "$UNSUP" >&2
-		compile_fallback "$SRC" "$srcname"
+		((NOFALLBACK)) && { rm -f "$tmp_ll"; die "$srcname: cannot compile natively: $UNSUP"; }
+		((QUIET)) || printf 'bashful: note: %s: %s -> using the embedded-bash fallback for this script (exact bash semantics, no native speedup)\n' "$srcname" "$UNSUP" >&2
+		compile_fallback "$BF_PROLOGUE$SRC$BF_EPILOGUE" "$srcname"
 		printf '%s' "$R" > "$tmp_ll" || die "cannot write $tmp_ll"
 	elif ((rc)); then
 		rm -f "$tmp_ll" "$tmp_ll.unsup"
 		exit $rc
 	fi
-
-	# default output name: input basename without extension (never overwrite the input)
-	final=$out
-	[[ -z $final ]] && ((runflag)) && final=/tmp/bashful.$$.run
-	if [[ -z $final ]]; then
-		b=${in##*/}
-		[[ $in == - ]] && b=a
-		if ((mode == 0)); then
-			if [[ $b == ?*.* ]]; then final=${b%.*}; else final=a.out; fi
-		else
-			[[ $b == ?*.* ]] && b=${b%.*}
-			if ((mode == 2)); then final=$b.bc; else final=$b.ll; fi
-		fi
-	fi
 	tmp_dir=/tmp/bashful.$$.rt
-	if ((mode == 1)); then tmp_out=/tmp/bashful.$$.out.ll; else tmp_out=/tmp/bashful.$$.out.bc; fi
-	((mode == 0)) && rt_cached && objs=$RT_OBJ
-	[[ $final == - ]] && stdout_mode=1
-	if ((mode != 0 && !stdout_mode)); then dst=$final; else dst=$tmp_out; fi
+	if ((MODE == 1)); then TMP_OUT=/tmp/bashful.$$.out.ll; else TMP_OUT=/tmp/bashful.$$.out.bc; fi
+	((MODE == 0)) && rt_cached && objs=$RT_OBJ
+	if ((MODE != 0)) && [[ $final != - ]]; then dst=$final; else dst=$TMP_OUT; fi
 	if [[ -n $objs ]]; then   # fast path: optimize the script (+ inlinable runtime helpers), link the cached native runtime
 		lld=
 		have_lld && lld=-fuse-ld=lld
@@ -257,17 +209,93 @@ main() {
 			rm -rf "$tmp_dir" "$tmp_ll"
 			die "could not compile the embedded runtime (need clang in PATH)"
 		fi
-		if ((mode == 1)); then llvm-link -S "$tmp_ll" "${RTOBJS[@]}" -o "$dst"; else llvm-link "$tmp_ll" "${RTOBJS[@]}" -o "$dst"; fi
+		if ((MODE == 1)); then llvm-link -S "$tmp_ll" "${RTOBJS[@]}" -o "$dst"; else llvm-link "$tmp_ll" "${RTOBJS[@]}" -o "$dst"; fi
 		rc=$?
 		rm -rf "$tmp_ll" "$tmp_dir"
 		((rc)) && die "could not link the embedded runtime (need llvm-link in PATH)"
-		if ((mode == 0)); then
-			clang -O2 -w "$tmp_out" -o "$final"
+		if ((MODE == 0)); then
+			clang -O2 -w "$TMP_OUT" -o "$final"
 			rc=$?
-			rm -f "$tmp_out"
+			rm -f "$TMP_OUT"
 			((rc)) && die "clang failed to build the executable"
 		fi
 	fi
+	return 0
+}
+main() {
+	local in= out= runflag=0 hascmd=0 cmdtext= srcname a rc final b keep path i interactive=0
+	local -a sargs args
+	MODE=0 NOFALLBACK=0 QUIET=0
+	load_tools
+	while (($#)); do
+		a=$1
+		if ((interactive)) || { [[ -n $in ]] && ((runflag || hascmd)); }; then sargs+=("$a"); shift; continue; fi   # everything after the script goes to the script
+		case $a in
+		-o | --output)
+			(($# > 1)) || { usage >&2; die "unknown option $a"; }
+			out=$2
+			shift
+			;;
+		-c | --command | --inline)
+			(($# > 1)) || { usage >&2; die "unknown option $a"; }
+			cmdtext=$2 hascmd=1 in=bash CMD_MODE=1
+			shift
+			;;
+		-i | --interactive) interactive=1 REPL_RC=1 ;;
+		--norc) REPL_NORC=1 ;;
+		-r | --run) runflag=1 ;;
+		--emit-ir) MODE=1 ;;
+		--emit-bc) MODE=2 ;;
+		--no-fallback | --strict) NOFALLBACK=1 ;;
+		-q | --quiet) QUIET=1 ;;
+		--no-embed) NO_EMBED=1 ;;
+		-h | --help) usage; exit 0 ;;
+		-?*)
+			# after the script, anything that is not a compiler option starts the script's arguments
+			if [[ -n $in && -z $out ]] && ((MODE == 0)); then runflag=1; sargs+=("$a")
+			else usage >&2; die "unknown option $a"; fi
+			;;
+		*)
+			if [[ -z $in ]]; then in=$a
+			elif [[ -z $out ]] && ((MODE == 0)); then runflag=1; sargs+=("$a")   # bashful script.sh args...
+			else die "unexpected argument $a"; fi
+			;;
+		esac
+		shift
+	done
+	if ((interactive)); then
+		[[ -z $in && -z $out ]] && ((!hascmd && !runflag && MODE == 0)) || die "-i/--interactive takes no script, -c, -r, -o or --emit-*: arguments after it become \$1, \$2, ..."
+		repl "${sargs[@]}"
+	fi
+	# no script at all: an interactive shell, like bash (only the options a shell takes)
+	if [[ -z $in && -z $out ]] && ((!hascmd && !runflag && MODE == 0 && !NOFALLBACK)); then repl; fi
+	if [[ -z $in ]]; then usage >&2; exit 1; fi
+	((hascmd && MODE == 0)) && runflag=1
+	if ((hascmd && ${#sargs[@]} > 0)); then   # like bash -c: the first extra argument is $0
+		in=${sargs[0]}
+		args=()
+		for ((i = 1; i < ${#sargs[@]}; i++)); do args+=("${sargs[i]}"); done
+		sargs=("${args[@]}")
+	fi
+	((runflag && MODE != 0)) && die "--run cannot be combined with --emit-ir/--emit-bc"
+	((MODE == 0 && !runflag)) && [[ -z $out ]] && runflag=1   # bashful script.sh: compile and run it
+	[[ $out == - ]] && ((MODE != 1)) && die "only --emit-ir can write to stdout"
+	if ((hascmd)); then SRC=$cmdtext srcname=-c; else slurp "$in"; srcname=$in; fi
+
+	# default output name: input basename without extension (never overwrite the input)
+	final=$out
+	[[ -z $final ]] && ((runflag)) && final=/tmp/bashful.$$.run
+	if [[ -z $final ]]; then
+		b=${in##*/}
+		[[ $in == - ]] && b=a
+		if ((MODE == 0)); then
+			if [[ $b == ?*.* ]]; then final=${b%.*}; else final=a.out; fi
+		else
+			[[ $b == ?*.* ]] && b=${b%.*}
+			if ((MODE == 2)); then final=$b.bc; else final=$b.ll; fi
+		fi
+	fi
+	build_exe "$srcname" "$final"
 	if ((runflag)); then
 		keep=0
 		[[ -n $out ]] && keep=1
@@ -277,9 +305,9 @@ main() {
 		rc=$?
 		((keep)) || rm -f "$final"
 		exit $rc
-	elif ((stdout_mode)); then
-		cat "$tmp_out"
-		rm -f "$tmp_out"
+	elif [[ $final == - ]]; then
+		cat "$TMP_OUT"
+		rm -f "$TMP_OUT"
 	fi
 	exit 0
 }

@@ -364,13 +364,15 @@ const char *bash_rt_special_s(int kind) {
     case SP_NARGS: rt_ltoa(buf, npos); return buf;
     case SP_PID: rt_ltoa(buf, (int)g_shell_pid); return buf;
     case SP_BANG: if (!g_last_bg) return ""; rt_ltoa(buf, (int)g_last_bg); return buf;
-    case SP_DASH: snprintf(buf, 32, "%s%s", opt_e ? "e" : "", opt_u ? "u" : ""); return buf;
+    case SP_DASH:   /* in bash's order: a script has hB, an interactive shell himBHs */
+        snprintf(buf, 32, "%sh%s%sB%s", opt_e ? "e" : "", g_interactive ? "im" : "", opt_u ? "u" : "", g_interactive ? "Hs" : ""); return buf;
     case SP_ZERO: return g_argv0;
     case SP_RANDOM: rt_ltoa(buf, bash_random()); return buf;
     case SP_PPID: rt_ltoa(buf, (int)getppid()); return buf;
     case SP_SECONDS: rt_ltoa(buf, (long)(time(NULL) - g_sec_base)); return buf;
     case SP_EPOCHSEC: rt_ltoa(buf, (long)time(NULL)); return buf;
     case SP_EPOCHREAL: { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); snprintf(buf, 32, "%ld.%06ld", (long)ts.tv_sec, ts.tv_nsec / 1000); return buf; }
+    case SP_LINENO: rt_ltoa(buf, g_lineno); return buf;
     }
     return "";
 }
@@ -378,6 +380,7 @@ long bash_rt_special_i(int kind) {
     switch (kind) {
     case SP_STATUS: return g_status; case SP_NARGS: return npos; case SP_PID: return g_shell_pid; case SP_PPID: return getppid(); case SP_BANG: return g_last_bg;
     case SP_RANDOM: return bash_random(); case SP_SECONDS: return (long)(time(NULL) - g_sec_base); case SP_EPOCHSEC: return (long)time(NULL);
+    case SP_LINENO: return g_lineno;
     }
     return 0;
 }
@@ -395,6 +398,7 @@ static const char *special_var(const char *n, int *found) {
     if (!strcmp(n, "SECONDS")) return bash_rt_special_s(SP_SECONDS);
     if (!strcmp(n, "EPOCHSECONDS")) return bash_rt_special_s(SP_EPOCHSEC);
     if (!strcmp(n, "EPOCHREALTIME")) return bash_rt_special_s(SP_EPOCHREAL);
+    if (!strcmp(n, "LINENO")) return bash_rt_special_s(SP_LINENO);
     if (isdigit((unsigned char)n[0])) { char *e; long k = strtol(n, &e, 10); if (*e == 0 && k >= 1 && k <= npos) return pos[k - 1]; if (*e == 0) { *found = 0; return NULL; } }
     *found = 0; return NULL;
 }
@@ -439,6 +443,16 @@ void ref_assign(const Ref *r, const char *s) {
 
 const char *bash_rt_getvar(const char *name) { Ref r; ref_from_name(name, &r); const char *s = ref_scalar(&r); ref_free(&r); return s; }
 void bash_rt_setvar(const char *name, const char *val) { bash_rt_set(name, val, 0); }
+/* __bashful_varver NAME OUT: OUT = a number that changes whenever NAME is assigned, unset or made local, even
+ * to the value it already had (getopts in shlib/getopts.sh starts over when OPTIND is assigned, like bash) */
+/* __bashful_warn MESSAGE: a message the way the runtime's own look ("script: line N: MESSAGE") */
+int bash_internal_bashful_warn(int argc, char **argv) { bash_rt_warn("%s", argc > 1 ? argv[1] : ""); return 0; }
+int bash_internal_bashful_varver(int argc, char **argv) {
+    if (argc < 3) return 2;
+    char buf[32]; rt_ltoa(buf, (long)vt[name_id(argv[1], 1)]->ver);
+    bash_rt_set(argv[2], buf, 0);
+    return 0;
+}
 void bash_rt_export(const char *name) { bash_rt_export_id(name_id(name, 1)); }
 void bash_rt_mark_readonly(const char *name) { bash_rt_readonly_id(name_id(name, 1)); }
 void bash_rt_unsetvar(const char *name) {

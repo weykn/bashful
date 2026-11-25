@@ -1,11 +1,14 @@
 # check.sh - pre-pass: user functions, set -e, literal eval/trap bodies, and detection of anything that cannot
 # be compiled exactly (-> whole-script fallback to an embedded bash)
 declare -A FBC FBV USERFN FNB_LAST FNB_COUNT
-for _x in source . jobs fg bg disown suspend shopt alias unalias getopts type hash compgen complete compopt enable \
-	caller pushd popd dirs ulimit umask times history fc bind logout help coproc select; do FBC[_$_x]=1; done
-for _x in BASH_LINENO LINENO PIPESTATUS BASHPID BASH_VERSINFO BASH_VERSION GROUPS DIRSTACK BASH_ARGV BASH_ARGC \
-	BASH_COMMAND BASH_SUBSHELL HISTCMD SHELLOPTS BASHOPTS OPTIND OPTARG COPROC BASH_ALIASES BASH_CMDS \
-	BASH_EXECUTION_STRING FUNCNEST PROMPT_COMMAND BASH_XTRACEFD TIMEFORMAT SRANDOM BASH_ARGV0 BASH_COMPAT BASH_ENV; do FBV[_$_x]=1; done
+for _x in source . jobs fg bg disown suspend shopt alias unalias type hash compgen complete compopt enable \
+	caller ulimit times history fc bind logout help coproc select; do FBC[_$_x]=1; done
+# builtins written in bash (shlib/NAME.sh, embedded in the compiler as SHLIB_NAME by the Makefile): a script
+# that calls one gets that file's functions, and the call becomes __bashful_b_<builtin>
+declare -A SHLIB_OF=([_getopts]=getopts [_pushd]=dirs [_popd]=dirs [_dirs]=dirs) SHLIB_NEED=()
+for _x in BASH_LINENO PIPESTATUS BASHPID BASH_VERSINFO BASH_VERSION GROUPS DIRSTACK BASH_ARGV BASH_ARGC \
+	BASH_COMMAND BASH_SUBSHELL HISTCMD SHELLOPTS BASHOPTS COPROC BASH_ALIASES BASH_CMDS \
+	BASH_EXECUTION_STRING FUNCNEST PROMPT_COMMAND BASH_XTRACEFD SRANDOM BASH_ARGV0 BASH_COMPAT BASH_ENV; do FBV[_$_x]=1; done
 NFNB=0 ERREXIT=0
 
 check_var() {
@@ -56,6 +59,37 @@ sig_ok() {
 	case $s in EXIT | INT | TERM | HUP | QUIT | USR1 | USR2 | PIPE | ALRM | CHLD | WINCH | CONT | TSTP) return 0 ;; esac
 	return 1
 }
+shlib_use() {   # node builtin: call the bash-written version instead
+	local n=$1 name=$2 w p
+	local -a ws
+	ws=(${NWS[n]})
+	p=${WL[ws[0]]}
+	PT[p]=__bashful_b_$name
+	SHLIB_NEED[_${SHLIB_OF[_$name]}]=1
+	if [[ $name == getopts ]] && ((${#ws[@]} == 3)); then   # getopts spec name: the caller's "$@"
+		mkword
+		w=$R
+		newpart $PK_PARAM @ 1
+		add_part $w $R
+		NWS[n]+=" $w"
+	fi
+}
+# the bash-written builtins the script needs, as top-level nodes -> R (" node node ...")
+shlib_nodes() {
+	local k v nodes= l
+	for k in "${!SHLIB_NEED[@]}"; do
+		v=SHLIB${k}
+		NOLINES=1   # $LINENO and messages inside a builtin show the caller's line
+		sub_enter "${!v}"
+		parse_list
+		l=$R
+		sub_leave
+		NOLINES=0
+		walk $l
+		nodes+=${NK[l]}
+	done
+	R=$nodes
+}
 walk_simple() {
 	local n=$1 name t i nw code body first_sig reset sg ex any asc nm a c ch wants_o opts allowed
 	local -a ws
@@ -64,6 +98,7 @@ walk_simple() {
 	lit_name ${ws[0]} || return 0
 	name=$R
 	[[ -n ${USERFN[_$name]} ]] && return 0
+	if [[ -n ${SHLIB_OF[_$name]} ]]; then shlib_use $n "$name"; return 0; fi
 	if [[ -n ${FBC[_$name]} ]]; then unsupported "'$name' builtin"; return 0; fi
 	case $name in
 	eval)
@@ -77,7 +112,7 @@ walk_simple() {
 			code+=$R
 		done
 		NFLAG[n]=1
-		parse_text "$code"
+		parse_text "$code" "${NLINE[n]}"
 		body=$R
 		NK[n]=" $body"
 		walk $body
@@ -92,7 +127,7 @@ walk_simple() {
 		if [[ $t == - ]]; then reset=1
 		elif ((nw == 2)) && sig_ok "$t"; then reset=1 first_sig=1
 		elif [[ $t == -* ]]; then unsupported "trap $t"; return 0
-		elif [[ -n $t ]]; then parse_text "$t"; body=$R; fi
+		elif [[ -n $t ]]; then parse_text "$t" "${NLINE[n]}"; body=$R; fi
 		if ((first_sig >= nw)); then unsupported "trap without signals"; return 0; fi
 		for ((i = first_sig; i < nw; i++)); do
 			word_const ${ws[i]}
@@ -176,12 +211,6 @@ walk_simple() {
 	unset)
 		for ((i = 1; i < nw; i++)); do
 			if word_const ${ws[i]} && [[ $R == -* && $R != -v ]]; then unsupported "unset $R"; return 0; fi
-		done
-		;;
-	printf)
-		((nw > 1)) || return 0
-		for ((i = 1; i < nw; i++)); do
-			if word_const ${ws[i]} && [[ $R == *'%('* ]]; then unsupported "printf %(...)T"; return 0; fi
 		done
 		;;
 	wait)

@@ -2,18 +2,20 @@
 #include "rt.h"
 
 /* ------------------------------------------------------------ arithmetic */
-typedef struct { const char *p; int err; int depth; } AP;
+/* dry: a checking pass with no side effects (no assignments, no division messages), so that an expression
+ * with a syntax error changes nothing, like in bash */
+typedef struct { const char *p; int err; int depth; int dry; } AP;
 static long ar_assign(AP *a);
 static long ar_comma(AP *a);
 static void ar_ws(AP *a) { while (*a->p == ' ' || *a->p == '\t' || *a->p == '\n') a->p++; }
 static int ar_isid(int c) { return isalnum(c) || c == '_'; }
-static long ar_value_of(const char *name, int depth) {
+static long ar_value_of(const char *name, int depth, int dry) {
     const char *s = bash_rt_getvar(name);
     if (!s || !*s) return 0;
     char *e; long v = strtol(s, &e, 0);
     if (*e == 0) return v;
     if (depth > 8) return 0;
-    char *c = xstrdup(s); AP sub = { c, 0, depth + 1 }; v = ar_comma(&sub); free(c); return v;
+    char *c = xstrdup(s); AP sub = { c, 0, depth + 1, dry }; v = ar_comma(&sub); free(c); return v;
 }
 static char *ar_ident(AP *a) {
     const char *s = a->p; if (*s == '$') s++;
@@ -39,11 +41,12 @@ static long ar_primary(AP *a) {
     }
     char *id = ar_ident(a);
     if (!id) { a->err = 1; return 0; }
-    long v = ar_value_of(id, a->depth);
+    long v = ar_value_of(id, a->depth, a->dry);
     ar_ws(a);
     if ((a->p[0] == '+' && a->p[1] == '+') || (a->p[0] == '-' && a->p[1] == '-')) {
         long nv = v + (a->p[0] == '+' ? 1 : -1); char b[32]; rt_ltoa(b, nv);
-        bash_rt_set(id, b, 0); a->p += 2;
+        if (!a->dry) bash_rt_set(id, b, 0);
+        a->p += 2;
     }
     free(id); return v;
 }
@@ -52,8 +55,9 @@ static long ar_unary(AP *a) {
     char c = *a->p;
     if ((c == '+' && a->p[1] == '+') || (c == '-' && a->p[1] == '-')) {
         a->p += 2; ar_ws(a); char *id = ar_ident(a); if (!id) { a->err = 1; return 0; }
-        long v = ar_value_of(id, a->depth) + (c == '+' ? 1 : -1); char b[32]; rt_ltoa(b, v);
-        bash_rt_set(id, b, 0); free(id); return v;
+        long v = ar_value_of(id, a->depth, a->dry) + (c == '+' ? 1 : -1); char b[32]; rt_ltoa(b, v);
+        if (!a->dry) bash_rt_set(id, b, 0);
+        free(id); return v;
     }
     if (c == '!') { a->p++; return !ar_unary(a); }
     if (c == '~') { a->p++; return ~ar_unary(a); }
@@ -71,7 +75,9 @@ static long ar_mul(AP *a) {
     for (;;) { ar_ws(a); char c = *a->p;
         if ((c == '*' && a->p[1] != '*' && a->p[1] != '=') || ((c == '/' || c == '%') && a->p[1] != '=')) {
             a->p++; long r = ar_pow(a);
-            if (c == '*') l *= r; else if (r == 0) { bash_rt_warn("division by 0"); a->err = 1; return 0; } else l = c == '/' ? bash_rt_div(l, r) : bash_rt_mod(l, r);
+            if (c == '*') l *= r;
+            else if (r == 0) { if (a->dry) { l = 0; continue; } bash_rt_warn("division by 0"); a->err = 1; return 0; }
+            else l = c == '/' ? bash_rt_div(l, r) : bash_rt_mod(l, r);
         } else return l; }
 }
 static long ar_add(AP *a) {
@@ -123,12 +129,13 @@ static long ar_assign(AP *a) {
         else if ((p[0] == '<' && p[1] == '<' && p[2] == '=') || (p[0] == '>' && p[1] == '>' && p[2] == '=')) { op = p[0] == '<' ? 'L' : 'R'; len = 3; }
         if (op && save[0] != '$') {
             a->p += len; long r = ar_assign(a), v = r;
-            if (op != '=') { long o = ar_value_of(id, a->depth);
+            if (op != '=') { long o = ar_value_of(id, a->depth, a->dry);
                 switch (op) { case '+': v = o + r; break; case '-': v = o - r; break; case '*': v = o * r; break;
-                    case '/': v = bash_rt_div(o, r); break; case '%': v = bash_rt_mod(o, r); break;
+                    case '/': v = a->dry && !r ? 0 : bash_rt_div(o, r); break; case '%': v = a->dry && !r ? 0 : bash_rt_mod(o, r); break;
                     case '&': v = o & r; break; case '|': v = o | r; break; case '^': v = o ^ r; break;
                     case 'L': v = o << (r & 63); break; case 'R': v = o >> (r & 63); break; } }
-            char b[32]; rt_ltoa(b, v); bash_rt_set(id, b, 0); free(id); return v;
+            char b[32]; rt_ltoa(b, v); if (!a->dry) bash_rt_set(id, b, 0);
+            free(id); return v;
         }
         free(id);
     }
@@ -136,7 +143,7 @@ static long ar_assign(AP *a) {
 }
 static long ar_comma(AP *a) { long v = ar_assign(a); for (;;) { ar_ws(a); if (*a->p != ',') return v; a->p++; v = ar_assign(a); } }   /* a, b: value of b */
 long ar_eval_str(const char *s, int depth) {
-    char *c = xstrdup(s); AP a = { c, 0, depth }; long v = ar_comma(&a); free(c); return v;
+    char *c = xstrdup(s); AP a = { c, 0, depth, 0 }; long v = ar_comma(&a); free(c); return v;
 }
 /* expansion context ($((...)), subscripts, ${s:off:len}): a syntax error ends the script (or the current
  * subshell) with status 1, like non-interactive bash */
@@ -147,9 +154,11 @@ long bash_rt_arith_eval(const char *expr, int *err) {
 }
 /* command context ((( )), let, [[ -eq ]]): an error only makes the command fail */
 long bash_rt_arith_eval_nf(const char *expr, int *err) {
-    AP a = { expr, 0, 0 }; long v = ar_comma(&a); ar_ws(&a);
+    AP d = { expr, 0, 0, 1 }; ar_comma(&d); ar_ws(&d);   /* check first: an error must change nothing */
+    if (*d.p || d.err) { if (err) *err = 1; bash_rt_warn("%s: arithmetic syntax error", expr); return 0; }
+    AP a = { expr, 0, 0, 0 }; long v = ar_comma(&a); ar_ws(&a);
     if (*a.p) a.err = 1;
-    if (a.err) { if (err) *err = 1; bash_rt_warn("%s: arithmetic syntax error", expr); return 0; }
+    if (a.err) { if (err) *err = 1; return 0; }   /* (division by 0, already reported) */
     if (err) *err = 0; return v;
 }
 long bash_rt_arith_str(const char *expr) { int e; return bash_rt_arith_eval(expr, &e); }

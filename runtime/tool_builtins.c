@@ -96,6 +96,21 @@ static int printf_once(Buf *o, const char *fmt, int argc, char **argv, int *ai) 
         if (*p == '*') { char *a = *ai < argc ? argv[(*ai)++] : "0"; k += snprintf(spec + k, 20, "%lld", arg_int(a)); p++; used = 1; }
         else while (isdigit((unsigned char)*p) && k < 30) spec[k++] = *p++;
         if (*p == '.') { spec[k++] = *p++; if (*p == '*') { char *a = *ai < argc ? argv[(*ai)++] : "0"; k += snprintf(spec + k, 20, "%lld", arg_int(a)); p++; } else while (isdigit((unsigned char)*p) && k < 50) spec[k++] = *p++; }
+        if (*p == '(') {   /* %(strftime format)T: the argument is seconds since the epoch, -1 now, -2 the shell's start */
+            const char *e = strchr(p, ')');
+            if (e && e[1] == 'T') {
+                const char *arg = *ai < argc ? argv[(*ai)++] : NULL; if (arg) used = 1;
+                long long t = arg && *arg ? arg_int(arg) : -1;
+                time_t tt = t == -1 ? time(NULL) : t == -2 ? bash_rt_start_time() : (time_t)t;
+                char f[256], out[1024]; snprintf(f, sizeof f, "%.*s", (int)(e - p - 1), p + 1);
+                struct tm *tm = localtime(&tt);
+                size_t L = tm ? strftime(out, sizeof out, *f ? f : "%X", tm) : 0; out[L] = 0;
+                spec[k++] = 's'; spec[k] = 0;
+                int need = snprintf(NULL, 0, spec, out); char *buf = malloc(need + 1); snprintf(buf, need + 1, spec, out); bput(o, buf, need); free(buf);
+                p = e + 1;
+                continue;
+            }
+        }
         char conv = *p; if (!conv) break;
         const char *arg = *ai < argc ? argv[(*ai)++] : NULL; if (arg) used = 1;
         char tmp[512]; int n = 0;
@@ -107,7 +122,7 @@ static int printf_once(Buf *o, const char *fmt, int argc, char **argv, int *ai) 
         case 's': case 'b': case 'q': {
             Buf t = { 0 }; const char *s = arg ? arg : "";
             if (conv == 'b') { unescape_into(&t, s, 1); s = t.s ? t.s : ""; }
-            if (conv == 'q') { Buf q = { 0 }; for (const char *c = s; *c; c++) { if (!isalnum((unsigned char)*c) && !strchr("_-./,:@%+=", *c)) bputc(&q, '\\'); bputc(&q, *c); } t = q; s = t.s ? t.s : "''"; }
+            if (conv == 'q') { char *q = bash_rt_printf_q(s); t.s = q; t.n = strlen(q); s = q; }
             spec[k++] = 's'; spec[k] = 0;
             int need = snprintf(NULL, 0, spec, s); char *buf = malloc(need + 1); snprintf(buf, need + 1, spec, s); bput(o, buf, need); free(buf); free(t.s); break; }
         default: bputs(o, spec); bputc(o, conv);
@@ -433,3 +448,68 @@ static int mapfile_impl(int argc, char **argv) {
 }
 int bash_internal_mapfile(int argc, char **argv) { return mapfile_impl(argc, argv); }
 int bash_internal_readarray(int argc, char **argv) { return mapfile_impl(argc, argv); }
+
+/* umask [-p] [-S] [mode]: the mode is octal, or symbolic like chmod's (u=rwx,g=rx,o= / go-w / a+r), which
+ * describes the permissions that are *allowed*: the mask is its complement */
+static void umask_symbolic(Buf *o, mode_t m) {
+    static const char *who = "ugo";
+    for (int i = 0; i < 3; i++) {
+        int allow = ~m >> (6 - 3 * i) & 7;
+        if (i) bputc(o, ',');
+        bputc(o, who[i]); bputc(o, '=');
+        if (allow & 4) bputc(o, 'r');
+        if (allow & 2) bputc(o, 'w');
+        if (allow & 1) bputc(o, 'x');
+    }
+}
+static int umask_parse_symbolic(const char *s, mode_t old, mode_t *out) {
+    int perm = ~old & 0777;
+    while (*s) {
+        int who = 0;
+        for (; *s && strchr("ugoa", *s); s++) who |= *s == 'u' ? 0700 : *s == 'g' ? 0070 : *s == 'o' ? 0007 : 0777;
+        if (!who) who = 0777;
+        if (!*s || !strchr("+-=", *s)) { bash_rt_warn("umask: `%c': invalid symbolic mode operator", *s ? *s : ' '); return 1; }
+        while (*s && strchr("+-=", *s)) {
+            char op = *s++; int bits = 0;
+            for (; *s && *s != ',' && !strchr("+-=", *s); s++) {
+                if (*s == 'r') bits |= 0444; else if (*s == 'w') bits |= 0222; else if (*s == 'x') bits |= 0111;
+                else { bash_rt_warn("umask: `%c': invalid symbolic mode character", *s); return 1; }
+            }
+            bits &= who;
+            if (op == '+') perm |= bits; else if (op == '-') perm &= ~bits; else perm = (perm & ~who) | bits;
+        }
+        if (*s == ',') s++;
+    }
+    *out = (mode_t)(~perm & 0777);
+    return 0;
+}
+int bash_internal_umask(int argc, char **argv) {
+    int i = 1, sym = 0, reuse = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) { i++; break; }
+        for (const char *p = argv[i] + 1; *p; p++) {
+            if (*p == 'S') sym = 1; else if (*p == 'p') reuse = 1;
+            else { bash_rt_warn("umask: -%c: invalid option", *p); bash_rt_flush(); { static const char u[] = "umask: usage: umask [-p] [-S] [mode]\n"; if (write(2, u, sizeof u - 1) < 0) {} } return 2; }
+        }
+    }
+    mode_t old = umask(0); umask(old);
+    if (i >= argc) {   /* print it */
+        Buf o = { 0 };
+        if (reuse) bputs(&o, sym ? "umask -S " : "umask ");
+        if (sym) umask_symbolic(&o, old);
+        else { char t[16]; snprintf(t, sizeof t, "%04o", (unsigned)old); bputs(&o, t); }
+        bputc(&o, '\n'); outs(o.s); free(o.s);
+        return 0;
+    }
+    const char *m = argv[i]; mode_t nm;
+    if (isdigit((unsigned char)*m)) {
+        long v = 0; const char *p = m;
+        for (; *p >= '0' && *p <= '7'; p++) { v = v * 8 + (*p - '0'); if (v > 0777) break; }
+        if (*p || v > 0777) { bash_rt_warn("umask: %s: octal number out of range", m); return 1; }
+        nm = (mode_t)v;
+    } else if (umask_parse_symbolic(m, old, &nm)) return 1;
+    bash_rt_umask_changing();
+    umask(nm);
+    if (sym) { Buf o = { 0 }; umask_symbolic(&o, nm); bputc(&o, '\n'); outs(o.s); free(o.s); }
+    return 0;
+}

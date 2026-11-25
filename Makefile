@@ -2,16 +2,19 @@
 RT      := $(CURDIR)/runtime
 OPT     := -O2
 SRCS    := compiler/util.sh compiler/parser.sh compiler/check.sh compiler/emit.sh compiler/arith.sh \
-           compiler/test.sh compiler/gen.sh compiler/compile.sh compiler/rtlink.sh compiler/main.sh
+           compiler/test.sh compiler/gen.sh compiler/compile.sh compiler/rtlink.sh compiler/readline.sh compiler/repl.sh compiler/main.sh
+SHLIB   := $(wildcard shlib/*.sh)
 RTSRCS  := $(wildcard runtime/*.c runtime/*.h runtime/*.def)
 
 all: bashful
 
 # the compiler as one bash script (bashful compiles a single file: there is no `source`)
-build/bashful.sh: $(SRCS) Makefile
+# (shlib/NAME.sh, the builtins written in bash, become SHLIB_NAME='<source>')
+build/bashful.sh: $(SRCS) $(SHLIB) Makefile
 	@mkdir -p build
 	@{ printf '#!/usr/bin/env bash\n# bashful compiler: generated from compiler/*.sh by make\n'; \
 	  printf "RUNTIME_DIR='%s'\nOPT='%s'\n" '$(RT)' '$(OPT)'; \
+	  for f in $(SHLIB); do n=$${f##*/}; printf "SHLIB_%s='" "$${n%.sh}"; sed "s/'/'\\\\''/g" "$$f"; printf "'\n"; done; \
 	  cat $(SRCS); printf 'main "$$@"\n'; } > $@.tmp
 	@chmod +x $@.tmp && mv $@.tmp $@
 

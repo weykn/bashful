@@ -154,6 +154,7 @@ gen_simple() {
 		return
 	fi
 	if ((NFLAG[n] == 2)); then gen_trap $n; return; fi
+	((NLINE[n])) && emit "call void @bash_rt_lineno(i32 ${NLINE[n]})"   # $LINENO, "script: line N:" in messages
 	ws=(${NWS[n]})
 	nw=${#ws[@]}
 	if ((nw)) && lit_name ${ws[0]}; then name=$R hasname=1; fi
@@ -318,7 +319,7 @@ node_safe() {   # node first depth
 	((n)) || return 0
 	((depth > 8)) && return 1
 	case ${NT[n]} in
-	7 | 8 | 10 | 17) return 1 ;;   # while until for(( )) &
+	7 | 8 | 10 | 17 | 18) return 1 ;;   # while until for(( )) & time
 	0)
 		for w in ${NWS[n]}; do word_safe $w $depth || return 1; done
 		for a in ${NASG[n]}; do word_safe ${AVAL[a]} $depth || return 1; done
@@ -763,6 +764,13 @@ gen_node() {
 		gen_block_fn $R
 		emit "call void @bash_rt_background(ptr $R)"
 		set_status_const 0
+		;;
+	18)   # time: the runtime notes the clock and CPU times, runs nothing itself, then reports to stderr
+		r=$((TMP++))
+		emit "%t$r = call i32 @bash_rt_time_start()"
+		first_child $n
+		gen_node $R
+		emit "call void @bash_rt_time_end(i32 %t$r, i32 ${NS1[n]:-0})"
 		;;
 	15) native_test $n || gen_dbl $n ;;
 	16)

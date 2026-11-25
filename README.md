@@ -7,7 +7,8 @@ Scripts go through LLVM IR, and common tools (`cat`, `grep`, `sort`, ...) are bu
 so loops, `$(...)`, subshells and pipelines run without forking. If a script uses something bashful can't
 compile yet, the whole script runs through the system bash instead: still correct, just not faster.
 
-The compiler is written in bash and compiles itself.
+The compiler is written in bash and compiles itself. Some builtins are written in bash too (`getopts`,
+`pushd`/`popd`/`dirs`, in `shlib/`): a script that uses one gets it compiled in along with its own code.
 
 ## Build
 
@@ -21,15 +22,18 @@ make              # build ./bashful
 
 ```sh
 ./bashful main.sh -o main    # compile
-./bashful -r main.sh         # compile and run
+./bashful main.sh args...    # compile and run (or -r)
 ./bashful -c 'echo hi'       # compile and run a command
+./bashful                    # interactive shell (or -i)
 ```
 
 | Option | |
 |---|---|
 | `-o`, `--output FILE` | write the executable to `FILE` |
-| `-r`, `--run` | compile and run, passing the remaining arguments to the script |
+| `-r`, `--run` | compile and run, passing the remaining arguments to the script (the default without `-o`) |
 | `-c`, `--command STR` | compile and run `STR` |
+| `-i`, `--interactive` | interactive shell like `bash -i` (the default with no script); arguments after it become `$1`, `$2`, ... |
+| `--norc` | interactive shell without `/etc/bash.bashrc`, `~/.bashrc` and `~/.bashfulrc` |
 | `--emit-ir`, `--emit-bc` | write LLVM IR / bitcode instead of an executable |
 | `--strict` | fail on unsupported features instead of falling back to bash |
 | `--no-embed` | run `cat`, `grep`, `sort`, ... from the system instead of the built-in copies |

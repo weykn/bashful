@@ -20,8 +20,14 @@ void bash_rt_out(const char *s, size_t n) {
 }
 
 const char *g_argv0 = "bash";
+/* the line of the command running now (the compiler stores it before each command): $LINENO, and bash's
+ * "script: line N: " in messages, which an interactive shell leaves out */
+int g_lineno;
+void bash_rt_lineno(int line) { g_lineno = line; }
 void bash_rt_warn(const char *fmt, ...) {
-    char buf[1024]; int n = snprintf(buf, sizeof buf, "%s: ", g_argv0);
+    char buf[1024]; int n;
+    if (g_lineno > 0 && !g_interactive) n = snprintf(buf, sizeof buf, "%s: line %d: ", g_argv0, g_lineno);
+    else n = snprintf(buf, sizeof buf, "%s: ", g_argv0);
     va_list ap; va_start(ap, fmt); n += vsnprintf(buf + n, sizeof buf - n - 1, fmt, ap); va_end(ap);
     if (n > (int)sizeof buf - 2) n = sizeof buf - 2;
     buf[n++] = '\n'; bash_rt_flush(); raw_write(2, buf, n);

@@ -10,6 +10,7 @@ pid_t g_last_bg, g_shell_pid;
 
 void pos_release_block(void) { if (!(cur_sub && pos_block == cur_sub->sblock)) free(pos_block); pos_block = NULL; }
 void bash_rt_cwd_changing(void) { if (cur_sub && !cur_sub->cwd) cur_sub->cwd = getcwd(NULL, 0); }
+void bash_rt_umask_changing(void) { if (cur_sub && cur_sub->umask < 0) { mode_t m = umask(0); umask(m); cur_sub->umask = (int)m; } }
 
 static void frame_pop(void) {
     Frame *f = &frames[--nframes];
@@ -28,6 +29,7 @@ void bash_rt_fn_enter(int argc, char **argv) {
     pos = argc > 1 ? argv + 1 : NULL; npos = argc > 1 ? argc - 1 : 0; pos_block = NULL;   /* borrowed: the caller's argv outlives the call */
 }
 void bash_rt_fn_leave(void) { frame_pop(); }
+int rt_var_is_local(int id) { for (int i = 0; i < nloc; i++) if (locs[i].id == id) return 1; return 0; }
 void bash_rt_local_id(int id) {
     if (nframes == 0) return;
     int base = frames[nframes - 1].loc_base;
@@ -46,7 +48,7 @@ void bash_rt_declare_local(const char *name) {
 int bash_rt_subshell(bash_body_t body) {
     Sub s; volatile int st = 0;
     s.prev = cur_sub; s.frame_depth = nframes; s.redir_depth = nrs; s.tmp_depth = ntmp; s.log_base = nulog; s.saved_gen = cur_gen;
-    s.spos = pos; s.snpos = npos; s.sblock = pos_block; s.cwd = NULL; s.e = opt_e; s.u = opt_u; s.pf = opt_pipefail; s.trapsave = NULL;
+    s.spos = pos; s.snpos = npos; s.sblock = pos_block; s.cwd = NULL; s.umask = -1; s.e = opt_e; s.u = opt_u; s.pf = opt_pipefail; s.trapsave = NULL;
     cur_gen = ++gen_counter; cur_sub = &s;
     if (_setjmp(s.jb) == 0) st = body();
     else {
@@ -66,17 +68,81 @@ int bash_rt_subshell(bash_body_t body) {
     if (pos_block != s.sblock) free(pos_block);
     pos = s.spos; npos = s.snpos; pos_block = s.sblock;
     if (s.cwd) { if (chdir(s.cwd) != 0) {} free(s.cwd); }
+    if (s.umask >= 0) umask((mode_t)s.umask);
     opt_e = s.e; opt_u = s.u; opt_pipefail = s.pf;
     g_status = st; return st;
 }
 int g_is_child;
 bash_body_t trap_fn[65]; int trap_mode[65];   /* 0 default, 1 ignore, 2 run */
+
+/* interactive mode: the shell's state as bash code, read back by the REPL and put in front of the next command:
+ *   #bashful-state / variables, exports, cd, set -- / #bashful-opts / set -u ... / #bashful-pwd DIR /
+ *   #bashful-end STATUS (the command list ran to its end; __bashful_end holds its status) or #bashful-exit STATUS */
+static void sq(FILE *f, const char *s) {
+    fputc('\'', f);
+    for (; *s; s++) if (*s == '\'') fputs("'\\''", f); else fputc(*s, f);
+    fputc('\'', f);
+}
+static int repl_keep(const char *n) {
+    if (!(isalpha((unsigned char)*n) || *n == '_')) return 0;
+    for (const char *p = n; *p; p++) if (!(isalnum((unsigned char)*p) || *p == '_')) return 0;
+    if (!strncmp(n, "__bashful_", 10) || !strncmp(n, "BASHFUL_REPL", 12)) return 0;
+    return strcmp(n, "_") && strcmp(n, "RANDOM") && strcmp(n, "SECONDS") && strcmp(n, "PWD");
+}
+static void repl_dump(int code) {
+    FILE *f = fopen(g_repl_state, "w"); if (!f) return;
+    fputs("#bashful-state\n", f);
+    for (int i = 0; i < nvt; i++) {
+        Var *v = vt[i]; const char *n = v->name;
+        if (!repl_keep(n)) continue;
+        if (v->flags & VF_ASC) {
+            const char **ks; int k = asc_list(v->as, &ks, 1);
+            fprintf(f, "declare -A %s\n%s=()\n", n, n);
+            for (int j = 0; j < k; j++) { AItem *it = asc_find(v->as, ks[j], 0); fprintf(f, "%s[", n); sq(f, ks[j]); fputs("]=", f); sq(f, ai_str(it)); fputc('\n', f); }
+            free(ks);
+        } else if (v->flags & VF_ARR) {
+            fprintf(f, "%s=()\n", n);
+            for (int j = 0; j < v->arrn; j++) { const char *s = el_str(v, j); if (!s) continue; fprintf(f, "%s[%d]=", n, j); sq(f, s); fputc('\n', f); }
+        } else {
+            const char *s = var_str(v); if (!s) continue;
+            fprintf(f, "%s=", n); sq(f, s); fputc('\n', f);
+            if (v->flags & VF_EXP) fprintf(f, "export %s\n", n);
+        }
+    }
+    char *cwd = getcwd(NULL, 0);
+    if (cwd) { fputs("cd ", f); sq(f, cwd); fputs(" 2> /dev/null\n", f); }
+    fputs("set --", f);
+    for (int i = 0; i < npos; i++) { fputc(' ', f); sq(f, pos[i]); }
+    fputs("\n#bashful-opts\n", f);
+    if (opt_u) fputs("set -u\n", f);
+    if (opt_pipefail) fputs("set -o pipefail\n", f);
+    if (opt_e) fputs("set -e\n", f);
+    if (cwd) fprintf(f, "#bashful-pwd %s\n", cwd);
+    free(cwd);
+    int id = name_id("__bashful_end", 0); const char *end = id >= 0 ? var_str(vt[id]) : NULL;
+    if (end) fprintf(f, "#bashful-end %s\n", end); else fprintf(f, "#bashful-exit %d\n", code & 255);
+    fclose(f);
+    /* PROMPT_COMMAND's commands, one element per line: the REPL runs them after each command */
+    id = name_id("PROMPT_COMMAND", 0);
+    Var *pv = id >= 0 ? vt[id] : NULL;
+    if (pv && (pv->flags & VF_ARR ? pv->arrn > 0 : var_str(pv) != NULL)) {
+        size_t L = strlen(g_repl_state) + 4; char *pf = malloc(L); snprintf(pf, L, "%s.pc", g_repl_state);
+        FILE *g = fopen(pf, "w");
+        if (g) {
+            if (pv->flags & VF_ARR) { for (int j = 0; j < pv->arrn; j++) { const char *s = el_str(pv, j); if (s) fprintf(g, "%s\n", s); } }
+            else fprintf(g, "%s\n", var_str(pv));
+            fclose(g);
+        }
+        free(pf);
+    }
+}
 void bash_rt_exit(int code) {
     if (cur_sub) { cur_sub->exit_code = code & 255; _longjmp(cur_sub->jb, 1); }
     if (!g_is_child && trap_mode[0] == 2) { bash_body_t f = trap_fn[0]; trap_mode[0] = 0; g_status = code; f(); }
     bash_rt_flush();
     bash_rt_fd_sync();          /* leave the shared input offset where bash would */
     if (g_is_child) _exit(code & 255);
+    if (g_repl_state) repl_dump(code);
     exit(code & 255);
 }
 

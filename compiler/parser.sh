@@ -9,18 +9,30 @@
 # Redir r: RFD fd, ROP op, RT target word          Assign a: AN name, AAPP, AVAL word, AEL " elements", AISARR
 # Case item c: CIP " pattern words", CIB body       Here-doc h: HDB body word, HDD delim, HDS strip, HDQ quoted
 NN=0 NWD=0 NPT=0 NRD=0 NAS=0 NCIT=0 NHD=0
-S= I=0 PEND= LINEBASE=0 NOREBASE=1 SD=0
+S= I=0 PEND= LINEBASE=0 NOREBASE=1 SD=0 PROBE=0
+LN_I=0 LN_N=0 NOLINES=0   # cur_line's cache: S[0..LN_I) holds LN_N newlines; NOLINES: record no lines (shlib)
+SUBLINE=0   # inside $(...), `...` and <(...): the line they start on, which is bash's $LINENO for all of it
 
 # A sub-parser works on its own text (eval string, here-doc body, $(( )) text, backticks, ...)
+# (its lines are counted from line $2, or from the current line of the outer text)
 sub_enter() {
-	SS_S[SD]=$S SS_I[SD]=$I SS_P[SD]=$PEND SS_L[SD]=$LINEBASE
+	if [[ -n $2 ]]; then R=$2; else cur_line; fi
+	SS_S[SD]=$S SS_I[SD]=$I SS_P[SD]=$PEND SS_L[SD]=$LINEBASE SS_LI[SD]=$LN_I SS_LN[SD]=$LN_N
 	((SD++, NOREBASE++))
-	S=$1 I=0 PEND= LINEBASE=0
+	S=$1 I=0 PEND= LINEBASE=$((R - 1)) LN_I=0 LN_N=0
 }
 sub_leave() {
 	((SD--, NOREBASE--))
-	S=${SS_S[SD]} I=${SS_I[SD]} PEND=${SS_P[SD]} LINEBASE=${SS_L[SD]}
+	S=${SS_S[SD]} I=${SS_I[SD]} PEND=${SS_P[SD]} LINEBASE=${SS_L[SD]} LN_I=${SS_LI[SD]} LN_N=${SS_LN[SD]}
 	SS_S[SD]= SS_P[SD]=
+}
+cur_line() {   # R = the source line of position I (counted on from the last call: linear in the source)
+	local t
+	((I < LN_I)) && LN_I=0 LN_N=0
+	t=${S:LN_I:I-LN_I}
+	t=${t//$NOTNL/}
+	LN_N=$((LN_N + ${#t})) LN_I=$I
+	R=$((LINEBASE + LN_N + 1))
 }
 # Drop the consumed part of the main source.  bash pays for ${S:I:1} in proportion to the length of S, so
 # without this, running the compiler interpreted (the bootstrap) is quadratic in the script size.  Only done
@@ -30,7 +42,7 @@ rebase() {
 	nl=${pre//$NOTNL/}
 	LINEBASE=$((LINEBASE + ${#nl}))
 	S=${S:I}
-	I=0
+	I=0 LN_I=0 LN_N=0
 }
 
 mk() { ((++NN)); NT[NN]=$1; R=$NN; }
@@ -63,6 +75,10 @@ lit_name() {
 
 perr() {
 	local pre=${S:0:I} nl line
+	if ((PROBE)); then   # interactive mode: an error at the very end of the input means "needs more lines"
+		if ((SD)); then ((SS_I[0] >= ${#SS_S[0]})) && exit 4; else ((I >= ${#S})) && exit 4; fi
+		exit 5
+	fi
 	nl=${pre//$NOTNL/}
 	line=$((LINEBASE + ${#nl} + 1))
 	if ((ARMED)); then unsupported "line $line: $1"; fb_abort; fi
@@ -103,19 +119,20 @@ at_closer() {
 }
 
 flush_heredocs() {
-	local h e ln body list=$PEND c
+	local h e ln body list=$PEND c found
 	PEND=
 	for h in $list; do
-		body=
+		body= found=0
 		while [[ -n ${S:I:1} ]]; do
 			e=$I
 			while c=${S:e:1}; [[ -n $c && $c != $'\n' ]]; do ((e++)); done
 			ln=${S:I:e-I}
 			if ((HDS[h])); then while [[ $ln == $'\t'* ]]; do ln=${ln:1}; done; fi
 			if [[ -n $c ]]; then I=$((e + 1)); else I=$e; fi
-			[[ $ln == "${HDD[h]}" ]] && break
+			[[ $ln == "${HDD[h]}" ]] && { found=1; break; }
 			body+=$ln$'\n'
 		done
+		((PROBE && !found)) && exit 4   # interactive mode: read on until the delimiter
 		if ((HDQ[h])); then add_lit ${HDB[h]} "$body" 1 1
 		else
 			sub_enter "$body"
@@ -138,7 +155,8 @@ mark_catfile() {   # body
 	NWS[s]=" $R" NWN[s]=1 NFLAG[s]=3
 }
 scan_backtick() {   # w quoted
-	local i=$((I + 1)) t= c n b
+	local i=$((I + 1)) t= c n b osl=$SUBLINE
+	((SUBLINE || NOLINES)) || { cur_line; SUBLINE=$R; }
 	while c=${S:i:1}; [[ -n $c && $c != '`' ]]; do
 		if [[ $c == '\' ]]; then
 			n=${S:i+1:1}
@@ -153,13 +171,14 @@ scan_backtick() {   # w quoted
 	parse_list
 	b=$R
 	sub_leave
+	SUBLINE=$osl
 	mark_catfile $b
 	newpart $PK_CMD "" $2
 	PB[R]=$b
 	add_part $1 $R
 }
 scan_parts() {   # w stops dq   (dq: 0 plain word, 1 inside "...", 2 here-doc / $(( )) text)
-	local w=$1 stops=$2 dq=$3 c n e qs sP b q=0 run sp="[\\\\'\"\$\`<~$2]"
+	local w=$1 stops=$2 dq=$3 c n e qs sP b q=0 osl run sp="[\\\\'\"\$\`<~$2]"
 	((dq)) && q=1
 	while :; do
 		c=${S:I:1}
@@ -219,9 +238,12 @@ scan_parts() {   # w stops dq   (dq: 0 plain word, 1 inside "...", 2 here-doc / 
 			if ((dq == 0)) && [[ ${S:I+1:1} == '(' ]]; then
 				sP=$PEND
 				PEND=
+				osl=$SUBLINE
+				((SUBLINE || NOLINES)) || { cur_line; SUBLINE=$R; }
 				((I += 2))
 				parse_list
 				b=$R
+				SUBLINE=$osl
 				skip_ws 1
 				[[ ${S:I:1} != ')' ]] && perr "expected ) after <("
 				((I++))
@@ -301,8 +323,19 @@ scan_param() {   # w quoted ; at ${
 	newpart $PK_PARAM "$text" $quoted
 	p=$R
 	c=${S:i:1} c2=${S:i+1:1}
+	if ((ind)) && [[ $c == '*' || $c == '@' ]] && [[ $c2 == '}' && $text == [a-zA-Z_]* ]]; then   # ${!prefix*} ${!prefix@}
+		if [[ $c == '*' ]]; then PO[p]=$P_NAMES_STAR; else PO[p]=$P_NAMES; fi
+		I=$((i + 2))
+		add_part $w $p
+		return
+	fi
 	case $c in
 	'}') hasop=0 ;;
+	'@')   # ${x@Q} and the other transformations (the letter is the operand); @P is left to bash
+		[[ $c2 == [QEULuaAKk] && ${S:i+2:1} == '}' ]] && ((!ind && !len)) || perr "bad parameter expansion"
+		op=$P_AT
+		((i++))
+		;;
 	':')
 		case $c2 in
 		'-') op=$P_DEFAULT; ((i += 2)) ;;
@@ -355,6 +388,7 @@ scan_param() {   # w quoted ; at ${
 }
 scan_dollar() {   # w quoted ; at $
 	local w=$1 quoted=$2 n=${S:I+1:1} j d c text p sP b e
+	local osl
 	if [[ $n == '(' && ${S:I+2:1} == '(' ]]; then
 		j=$((I + 3)) d=0
 		while c=${S:j:1}; [[ -n $c ]]; do
@@ -381,9 +415,12 @@ scan_dollar() {   # w quoted ; at $
 	elif [[ $n == '(' ]]; then
 		sP=$PEND
 		PEND=
+		osl=$SUBLINE
+		((SUBLINE || NOLINES)) || { cur_line; SUBLINE=$R; }
 		((I += 2))
 		parse_list
 		b=$R
+		SUBLINE=$osl
 		skip_ws 1
 		[[ ${S:I:1} != ')' ]] && perr 'expected ) after $('
 		((I++))
@@ -724,6 +761,8 @@ parse_simple() {
 	local n seen=0 c save w fw
 	mk $N_SIMPLE
 	n=$R
+	if ((SUBLINE)); then NLINE[n]=$SUBLINE
+	elif ((!NOLINES)); then cur_line; NLINE[n]=$R; fi
 	while :; do
 		skip_ws 0
 		try_redir $n && continue
@@ -1037,7 +1076,7 @@ parse_command() {
 		fi
 		;;
 	esac
-	if at_kw select || at_kw coproc || at_kw time; then unsupported "'${S:I:6}' keyword"; fi
+	if at_kw select || at_kw coproc; then unsupported "'${S:I:6}' keyword"; fi
 	if at_kw '[['; then
 		((I += 2))
 		parse_dbl
@@ -1092,6 +1131,25 @@ parse_command() {
 	fi
 	parse_simple
 }
+# time [-p] pipeline: N_TIME, NS1 = 1 for -p.  A bare `time` (the shell's own times) is left to bash.
+parse_time() {
+	local posix=0 c n
+	((I += 4))
+	skip_ws 0
+	while [[ ${S:I:1} == - ]]; do
+		if at_kw -p; then posix=1; ((I += 2))
+		elif at_kw --; then ((I += 2)); skip_ws 0; break
+		else break; fi
+		skip_ws 0
+	done
+	c=${S:I:1}
+	case $c in '' | $'\n' | ';' | '&' | ')' | '|' | '#') unsupported "'time' without a command" ;; esac
+	parse_pipeline
+	n=$R
+	mk $N_TIME
+	NK[R]=" $n"
+	NS1[R]=$posix
+}
 parse_pipeline() {
 	local neg=0 first res
 	skip_ws 0
@@ -1100,6 +1158,17 @@ parse_pipeline() {
 		((I++))
 		skip_ws 0
 	done
+	if at_kw time; then   # time ... | ... times the whole pipeline
+		parse_time
+		res=$R
+		if ((neg)); then
+			mk $N_NOT
+			NK[R]=" $res"
+			return
+		fi
+		R=$res
+		return
+	fi
 	parse_command
 	first=$R res=$R
 	skip_ws 0
@@ -1175,9 +1244,9 @@ parse_list() {
 	done
 	R=$l
 }
-parse_text() {   # eval / trap strings
+parse_text() {   # eval / trap strings; $2 = the line of the eval / trap command
 	local l
-	sub_enter "$1"
+	sub_enter "$1" "$2"
 	parse_list
 	l=$R
 	skip_ws 1

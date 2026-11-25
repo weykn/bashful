@@ -42,7 +42,7 @@ ac_lvalue() {   # status 0 when an lvalue was parsed (AE may still be set)
 	name=${AT:st:s-st}
 	special_kind "$name"
 	sp=$R
-	((sp >= 10)) && return 1
+	((sp >= 10 && sp != 16)) && return 1   # (16: LINENO, a number)
 	if [[ ${AT:s:1} == '[' ]] && ((!sp)) && is_assoc "$name"; then
 		ac_subscript_end $((s + 1))
 		e=$R

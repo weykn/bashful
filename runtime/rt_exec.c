@@ -284,7 +284,11 @@ int bash_rt_fallback(int argc, char **argv, const char *script) {
     av[k++] = argc > 0 ? argv[0] : "bash";
     for (int i = 1; i < argc; i++) av[k++] = argv[i];
     av[k] = NULL;
-    execv(bash, av);
+    const char *rs = getenv("BASHFUL_REPL");
+    if (rs && getenv("BASHFUL_REPL_NOENV")) {   /* interactive mode: the script's prelude recreates the environment */
+        char *env[2] = { NULL, NULL }; size_t L = strlen(rs) + 14; env[0] = malloc(L); snprintf(env[0], L, "BASHFUL_REPL=%s", rs);
+        execve(bash, av, env);
+    } else execv(bash, av);
     perror(bash); return 127;
 }
 

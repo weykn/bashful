@@ -21,7 +21,7 @@ special_kind() {   # R = SP_* for special parameters, 0 otherwise; status 0 when
 	case $1 in
 	'?') R=1 ;; '#') R=2 ;; '$') R=3 ;; '!') R=4 ;; '-') R=5 ;; 0) R=6 ;; '@') R=10 ;; '*') R=11 ;;
 	RANDOM) R=7 ;; PPID) R=8 ;; SECONDS) R=9 ;; FUNCNAME) R=12 ;; BASH_SOURCE) R=13 ;;
-	EPOCHSECONDS) R=14 ;; EPOCHREALTIME) R=15 ;;
+	EPOCHSECONDS) R=14 ;; EPOCHREALTIME) R=15 ;; LINENO) R=16 ;;
 	*) R=0; return 1 ;;
 	esac
 	return 0
